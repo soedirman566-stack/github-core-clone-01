@@ -1,119 +1,102 @@
-// Entry point for the forge. This file owns only the harness lifecycle:
-// bring the HTTP app up on an ephemeral port, tell the grading environment
-// where it can be reached, hold it open until the environment reports the
-// trial over, then shut down. Everything GitHub-shaped lives in app.ts.
+// main.ts — the process lifecycle the trial harness drives.
+//
+//   1. bind an ephemeral port on loopback (never 8080: that is the env's);
+//   2. POST {"port": N} to $MAKEFUN_ENV_URL/register — the first register
+//      wins, a conflict means we are already registered, and a 400/405 is a
+//      contract failure worth dying on;
+//   3. serve until GET $MAKEFUN_ENV_URL/done answers {"done": true}, then
+//      exit 0. Poll with backoff; never hold a request open.
+//
+// Errors before registration are fatal (stderr + exit 1): a forge that cannot
+// announce itself can only fail the trial by silence otherwise. SIGTERM and
+// SIGINT close the listener before exiting, so a harness that stops the
+// process early never leaves a half-bound port behind.
 
-import { createApp } from './app.ts';
+import { createForgeServer } from './app.ts';
+import { Store } from './store.ts';
 
-// Each request to the environment gets thirty seconds before we abandon it.
-const REQUEST_TIMEOUT_MS = 30_000;
+/** Register retries before the env is declared unreachable. */
+const REGISTER_MAX_ATTEMPTS = 60;
 
-// Patience schedule: a quarter second at first, doubling after every
-// failure, never longer than two seconds a wait.
-const FIRST_WAIT_MS = 250;
-const LONGEST_WAIT_MS = 2_000;
-const MAX_DOUBLINGS = 8;
-
-function pause(ms: number): Promise<void> {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function waitAfter(failures: number): number {
-  const grown = FIRST_WAIT_MS * 2 ** Math.min(failures, MAX_DOUBLINGS);
-  return Math.min(grown, LONGEST_WAIT_MS);
-}
+async function main(): Promise<void> {
+  const envUrl = process.env.MAKEFUN_ENV_URL;
+  if (!envUrl) throw new Error('MAKEFUN_ENV_URL is not set');
+  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const base = envUrl.replace(/\/+$/, '');
 
-// POST our port to the environment's /register endpoint, retrying until it
-// sticks. 200 means we checked in; 409 means another instance registered
-// first, which counts as checked in too. 400 and 405 can never succeed, so
-// those abort. Anything else, network failures included, earns a retry.
-async function checkIn(base: string, port: number): Promise<void> {
-  let failures = 0;
-  for (;;) {
-    let reply: Response | null = null;
-    try {
-      reply = await fetch(`${base}/register`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-    } catch {
-      reply = null; // environment unreachable for now; the wait below applies
-    }
-    if (reply !== null) {
-      if (reply.status === 200 || reply.status === 409) return;
-      if (reply.status === 400 || reply.status === 405) {
-        const detail = await reply.text();
-        throw new Error(`check-in refused (HTTP ${reply.status}): ${detail}`);
-      }
-    }
-    await pause(waitAfter(failures));
-    failures += 1;
-  }
-}
+  const store = new Store();
+  const server = createForgeServer(store, token);
 
-// Poll /done until its JSON body really carries done: true. A failed
-// request or a "not yet" body both mean: back off and ask again.
-async function holdUntilDone(base: string): Promise<void> {
-  let failures = 0;
-  for (;;) {
-    try {
-      const reply = await fetch(`${base}/done`, {
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (reply.ok) {
-        const body: unknown = await reply.json();
-        if (
-          typeof body === 'object' &&
-          body !== null &&
-          (body as { done?: unknown }).done === true
-        ) {
-          return;
-        }
-      }
-    } catch {
-      // A blown poll is only a slower "not yet".
-    }
-    await pause(waitAfter(failures));
-    failures += 1;
-  }
-}
+  const shutdown = (code: number): void => {
+    server.close(() => process.exit(code));
+    // If connections linger, do not let the close wait forever.
+    setTimeout(() => process.exit(code), 1000).unref();
+  };
+  process.on('SIGTERM', () => shutdown(0));
+  process.on('SIGINT', () => shutdown(0));
 
-async function run(): Promise<void> {
-  const given = process.env.MAKEFUN_ENV_URL;
-  if (given === undefined || given.trim() === '') {
-    console.error('MAKEFUN_ENV_URL is unset, so there is nowhere to check in.');
-    process.exit(1);
-  }
-  const base = given.replace(/\/+$/, '');
-
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
+  const port = await new Promise<number>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, () => {
-      server.removeListener('error', reject);
-      resolve();
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') reject(new Error('no bound address'));
+      else resolve(address.port);
     });
   });
 
-  const bound = server.address();
-  if (bound === null || typeof bound === 'string') {
-    throw new Error('the app server did not report the port it bound');
+  // Register, retrying transient failures with backoff. 200 (accepted) and
+  // 409 (already registered) both mean the env knows where we live; 400/405
+  // are contract failures, and a bounded attempt count keeps a dead env from
+  // hanging the trial's boot budget.
+  let delay = 250;
+  let registered = false;
+  for (let attempt = 1; attempt <= REGISTER_MAX_ATTEMPTS && !registered; attempt += 1) {
+    let status: number | null = null;
+    try {
+      const response = await fetch(`${base}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ port }),
+      });
+      status = response.status;
+      await response.text().catch(() => '');
+    } catch {
+      status = null;
+    }
+    if (status === 200 || status === 409) registered = true;
+    else if (status === 400 || status === 405) throw new Error(`register refused with HTTP ${status}`);
+    else if (attempt < REGISTER_MAX_ATTEMPTS) {
+      await sleep(delay);
+      delay = Math.min(delay * 2, 2000);
+    }
+  }
+  if (!registered) throw new Error(`register did not succeed after ${REGISTER_MAX_ATTEMPTS} attempts`);
+
+  // Long-poll /done until the suite is over.
+  delay = 250;
+  for (;;) {
+    let done = false;
+    try {
+      const response = await fetch(`${base}/done`);
+      const payload = (await response.json()) as { done?: unknown };
+      done = payload.done === true;
+    } catch {
+      done = false;
+    }
+    if (done) break;
+    await sleep(delay);
+    delay = Math.min(delay * 2, 2000);
   }
 
-  console.log(`forge listening on port ${bound.port}; checking in with the suite`);
-  await checkIn(base, bound.port);
-  console.log('checked in; standing by while the suite runs');
-  await holdUntilDone(base);
-  console.log('suite reports done; shutting the forge down');
-  server.close();
+  shutdown(0);
 }
 
-try {
-  await run();
-  process.exit(0);
-} catch (err) {
-  console.error(err instanceof Error ? (err.stack ?? err.message) : String(err));
+main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
-}
+});
+

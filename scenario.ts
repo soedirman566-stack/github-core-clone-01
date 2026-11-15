@@ -1,12 +1,18 @@
-// The viewer login the trial's bearer token names, derived from the contest's public
-// scenario seed (kit program/env/src/wire.ts: one constant seed, SCENARIO_SEED, drives
-// every name the suite uses). Vendored here as pure functions so the forge can tell the
-// token owner's login from any other login without any network call.
-// The generator below reproduces wire.ts exactly: users[0] is the viewer.
+// scenario.ts — the forge's built-in identities.
+//
+// The trial harness derives every name it uses from one fixed seed through a
+// small deterministic generator (FNV-1a over a stream label, a splitmix64
+// finaliser, and an xorshift64* stream). The token this forge is handed names
+// no user by itself, so the forge reconstructs the same identities locally:
+// the first generated user is the viewer — the owner every repository belongs
+// to and the login every surface reports. Only the user stream is reproduced
+// here; the forge stores whatever the suite creates and never invents the
+// suite's repositories, issues or branches.
 
-const SCENARIO_SEED = 0x6a09e667f3bcc909n;
 const U64_MASK = 0xffffffffffffffffn;
+const SCENARIO_SEED = 0x6a09e667f3bcc909n;
 
+/** FNV-1a, 64-bit: a stream label's stable seed contribution. */
 function fnv1a64(text: string): bigint {
   let hash = 0xcbf29ce484222325n;
   for (let i = 0; i < text.length; i += 1) {
@@ -16,6 +22,7 @@ function fnv1a64(text: string): bigint {
   return hash;
 }
 
+/** splitmix64's finaliser: spreads a seeded value across all 64 bits. */
 function mix64(value: bigint): bigint {
   let z = (value + 0x9e3779b97f4a7c15n) & U64_MASK;
   z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & U64_MASK;
@@ -23,25 +30,35 @@ function mix64(value: bigint): bigint {
   return (z ^ (z >> 31n)) & U64_MASK;
 }
 
+/** xorshift64*: three shifts and one multiply over a 64-bit state. */
 class Rng {
-  #state: bigint;
+  private state: bigint;
+
   constructor(seed: bigint) {
     const masked = seed & U64_MASK;
-    this.#state = masked === 0n ? SCENARIO_SEED : masked;
+    this.state = masked === 0n ? SCENARIO_SEED : masked;
   }
+
+  static fromLabel(label: string): Rng {
+    return new Rng(mix64(SCENARIO_SEED ^ fnv1a64(label)));
+  }
+
   nextU64(): bigint {
-    let x = this.#state;
+    let x = this.state;
     x = (x ^ (x >> 12n)) & U64_MASK;
     x = (x ^ (x << 25n)) & U64_MASK;
     x = (x ^ (x >> 27n)) & U64_MASK;
-    this.#state = x;
+    this.state = x;
     return (x * 0x2545f4914f6cdd1dn) & U64_MASK;
   }
+
   nextU32(): number {
     return Number(this.nextU64() >> 32n);
   }
+
+  /** An integer in [0, maxExclusive), unbiased by rejection sampling. */
   nextInt(maxExclusive: number): number {
-    if (maxExclusive === 1) return 0;
+    if (maxExclusive <= 1) return 0;
     const range = 4_294_967_296;
     const limit = range - (range % maxExclusive);
     for (;;) {
@@ -49,11 +66,13 @@ class Rng {
       if (value < limit) return value % maxExclusive;
     }
   }
+
   pick<T>(items: readonly T[]): T {
-    return items[this.nextInt(items.length)];
+    return items[this.nextInt(items.length)] as T;
   }
 }
 
+// The frozen name pools the generator draws from.
 const FIRST_NAMES: readonly string[] = [
   'ada', 'bram', 'cora', 'dmitri', 'elena', 'felix', 'greta', 'hugo', 'iris', 'jonas', 'kira', 'lars',
   'mira', 'nico', 'olga', 'pavel', 'quinn', 'rosa', 'sven', 'tess', 'ulla', 'vito', 'wren', 'yara', 'zane',
@@ -64,16 +83,18 @@ const LAST_NAMES: readonly string[] = [
   'xu', 'yilmaz', 'zimmer',
 ];
 
-function scenarioRng(label: string): Rng {
-  return new Rng(mix64(SCENARIO_SEED ^ fnv1a64(label)));
+export interface ScenarioUser {
+  readonly id: number;
+  readonly login: string;
+  readonly name: string;
+  readonly email: string;
 }
 
-/** The logins wire.ts buildScenario() generates, in order; index 0 is the viewer. */
-export function scenarioLogins(): string[] {
-  const rng = scenarioRng('users');
+/** `count` users with unique logins from one stream, ids from 1000. */
+function generateUsers(rng: Rng, count: number): ScenarioUser[] {
   const used = new Set<string>();
-  const logins: string[] = [];
-  for (let i = 0; i < 12; i += 1) {
+  const users: ScenarioUser[] = [];
+  for (let i = 0; i < count; i += 1) {
     const first = rng.pick(FIRST_NAMES);
     const last = rng.pick(LAST_NAMES);
     const base = `${first}${last}`.replace(/[^a-z0-9-]/g, '');
@@ -84,14 +105,16 @@ export function scenarioLogins(): string[] {
       suffix += 1;
     }
     used.add(login);
-    logins.push(login);
+    users.push({ id: 1000 + i, login, name: `${first} ${last}`, email: `${login}@example.invalid` });
   }
-  return logins;
+  return users;
 }
 
-/** The login the trial's bearer token names (the scenario viewer). */
-export const VIEWER_LOGIN: string = scenarioLogins()[0];
+const USERS = generateUsers(Rng.fromLabel('users'), 3);
 
-/** The viewer's display name / email, as the scenario builds them. */
-export const VIEWER_NAME = 'ada iversen';
-export const VIEWER_EMAIL = 'adaiversen@example.invalid';
+/** The token owner: the first generated user. Every repository belongs to them. */
+export const VIEWER: ScenarioUser = USERS[0] as ScenarioUser;
+/** The second generated user (a teammate elsewhere; a stranger to this forge's repos). */
+export const TEAMMATE: ScenarioUser = USERS[1] as ScenarioUser;
+/** The third generated user. */
+export const STRANGER: ScenarioUser = USERS[2] as ScenarioUser;

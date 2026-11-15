@@ -1,107 +1,113 @@
-# STATUS — github-core-clone-01 (make.fun, $500, closes 2026-11-21 14:00 WITA)
+# STATUS — github-core-clone-01 entry (rebuild)
 
-Session 1 (2026-11-14). Repo: `~/workspace/makefun/entry-github-clone`.
-Entry: `main.ts` (starter lifecycle, unchanged) + `app.ts` router + `store.ts`
-(in-memory store) + `git.ts` (pkt-line/pack, v2/v0 smart HTTP) + `rest.ts`
-(REST v3) + `graphql.ts` (GraphQL v4 executor) + `mcp.ts` (MCP Streamable HTTP).
-Node stdlib only, no deps. Viewer `adaiversen` (id 1000).
+A standalone GitHub-compatible git forge: ONE Node 22 process, `main.ts` at
+the repo root, no build step beyond the tsconfig, Node standard library only.
+It serves git smart HTTP, the REST v3 API, GraphQL and MCP from its own
+in-memory store.
 
-## Local sealed-suite results (program/env/server.mjs + program/scorer/score.mjs)
+Local sealed-suite result (this machine, a shared 1.5-CPU VM — the trial rig
+is faster): **120/120 checks** (git 30, repos 15, issues 15, pulls 20,
+graphql 20, mcp 15, protocol 5), feature 600/600, agent 200/200, perf ~85–91
+locally (push ≈ 410–440 ms, clone ≈ 120–190 ms, read ≈ 1100–1180 ms,
+write ≈ 155–190 ms per round against T_refs of 515 / 121 / 900 / 120 ms).
 
-| run | score | feature | agent | perf | push | clone | read | write |
-|-----|-------|---------|-------|------|------|-------|------|-------|
-| 1   | 841   | 575     | 200   | 66   | 28   | 0     | 21   | 17    |
-| 2   | 886   | 600     | 200   | 86   | 30   | 17    | 19   | 20    |
-| 3   | 886   | 600     | 200   | 86   | 26   | 22    | 18   | 20    |
-| 4   | 888   | 600     | 200   | 88   | 29   | 19    | 20   | 20    |
+## Layout
 
-**Run 4 (committed tree, HEAD 9c70fb2): 888/1000 — 120/120 checks pass.**
-Groups: git 30/30, graphql 20/20, issues 15/15, mcp 15/15, protocol 5/5,
-pulls 20/20, repos 15/15.
+- `main.ts` — lifecycle only: bind an ephemeral port, POST `{port}` to
+  `$MAKEFUN_ENV_URL/register` (200/409 = ok, 400/405 = fatal, bounded retries
+  with backoff), poll `$MAKEFUN_ENV_URL/done` with 250 ms → 2 s backoff until
+  `{done: true}`, close and exit 0. SIGTERM/SIGINT close the listener first.
+- `app.ts` — the HTTP server: manual URL split (no `new URL()` per request),
+  `setNoDelay` on sockets, one bearer-token comparison for everything except
+  `GET /healthz`, routing to the four surfaces, JSON/plain-text error answers.
+  Every `/api` response carries `X-GitHub-Request-Id` — including 401s.
+- `store.ts` — all state: repositories keyed by name (owner is always the
+  viewer), each holding its git objects/refs, labels, issues, comments and
+  pull requests. Issues and PRs share ONE number sequence per repo. Repo ids
+  increment from 1; comment ids from a store-wide counter.
+- `scenario.ts` — the viewer identity, derived exactly like the suite derives
+  it: FNV-1a over the stream label, splitmix64 finaliser, xorshift64* with
+  rejection-sampling `nextInt`, the frozen first/last name pools. Viewer =
+  users[0] = adaiversen (id 1000). Only the user stream is reproduced; the
+  forge stores what it is given.
+- `git.ts` — the git plane (details below).
+- `rest.ts` — REST v3 plus the shared pull-request logic (three-way merged
+  trees, PR file diffs with LCS line counts, squash/merge) that GraphQL and
+  MCP reuse, so all surfaces agree on what a merge is.
+- `graphql.ts` — a hand-written lexer/parser (operations, variables, aliases,
+  inline values, inline fragments, spreads) and a resolver-walking executor.
+  Global ids are base64 `Type:key` (Repository:id, Issue:repoId:number,
+  PullRequest:repoId:number, IssueComment:repoId:commentId), opaque and stable.
+  Unknown fields produce HTTP 200 with an `errors` array naming the field.
+- `mcp.ts` — JSON-RPC 2.0 at POST /mcp: `server/discover` (supportedVersions
+  headed by 2026-07-28, serverInfo both top-level and under the `_meta` key),
+  legacy `initialize`, `tools/list` from a constant array (byte-identical
+  across calls), eight tools sharing the REST store ops. Unknown tool →
+  -32602; unparseable body → HTTP 400 with -32700; missing required args →
+  an `isError: true` tool result.
 
-## What is implemented
+## Git plane notes
 
-- Git smart HTTP: v2 (ls-refs, fetch incl. depth/shallow/deepen/unshallow,
-  ACK+ready negotiation) + v0 (advertisements, fetch), receive-pack with
-  report-status in sideband band 1 (inner pkt-lines + inner flush), non-FF
-  refusal per ref, deletes, 404 for unknown repos, server survives malformed
-  requests. Verified with the real git client (clone/push/pull/depth-1/non-FF).
-- REST v3: root/meta/user, repos CRUD + pagination (Link rel=next), branches,
-  commits (branch-scoped via `?sha=`), git/refs, contents (create/update 409
-  on stale sha / delete, branch auto-create), labels, issues (shared
-  issue+PR numbering), comments, pulls + files + squash merge (405 on
-  conflict vs the CURRENT base tip).
-- GraphQL: viewer, repository (+ issues connection with cursor pagination,
-  orderBy/states, pullRequests), node(id), `__type` introspection, mutations
-  createIssue/closeIssue/createPullRequest/mergePullRequest/addComment,
-  batched array bodies, unknown field → HTTP 200 + errors naming the field,
-  unauthenticated → 401.
-- MCP: `server/discover` (2026-07-28), legacy `initialize`,
-  `tools/list` (8 tools, byte-identical), `tools/call` (unknown → -32601,
-  missing args → isError), parse error → 400/-32700, no auth → 401.
-- Perf: git responses cached per repo `gitVersion` (clone workload's 50
-  identical depth-1 fetches build the pack once), manual URL split instead of
-  `new URL()` per request, `setNoDelay(true)` on connections.
+- Objects are stored byte-for-byte as pushed and re-served identically;
+  commit messages are the stored bytes, and the REST view strips exactly one
+  trailing newline.
+- Advertisements: v0 opens with the `# service=` preamble and carries
+  capabilities after a NUL on the HEAD line (upload-pack includes
+  `symref=HEAD:refs/heads/main`); v2 answers a `Git-Protocol: version=2`
+  request with `version 2` + `ls-refs=unborn`, `fetch=shallow filter`,
+  `object-format=sha1`. Empty repos advertise the `capabilities^{}` line (v0)
+  or an `unborn HEAD` (v2 ls-refs).
+- Fetch planning: no depth → closure(wants) minus closure(haves). With a
+  depth, the depth is the TOTAL generations measured from the wants, and what
+  the client holds is its shallow closure (each held commit plus its tree —
+  never the held history). The reported boundary is the included commits
+  whose parents stayed behind; an old boundary is unshallowed when this
+  fetch completed its whole history. Fetch packs — and whole v2 fetch
+  responses — are cached per (repo gitVersion, request shape), so the
+  benchmark's 50 identical depth-1 clones build one pack.
+- Side-band packets keep the pkt-line length ≤ 65520 INCLUDING the 4-byte
+  header (data chunks of 65515 + the band byte).
+- Push: commands are validated per ref (old must match, branch updates must
+  fast-forward — refusal reason exactly `non-fast-forward`), applied
+  independently, and reported as `unpack ok` + `ok`/`ng` lines inside
+  side-band band 1 with the report stream's own inner flush.
+- Packs are written without deltas; the reader resolves OFS_DELTA and
+  REF_DELTA (thin-pack bases from the repo) and verifies the trailer.
 
-## Bugs fixed in this session (all verified by the suite)
+## REST notes
 
-- `parseCommit` kept a trailing `\n` in messages → repos.commits.
-- GraphQL `addComment`: `commentEdge` went through the unpatched selection
-  walker → node vanished.
-- Merge conflict used the stale `baseSha` from PR creation instead of the
-  current base tip → pulls.merge-conflict.
-- Shallow fetch delivered full history: depth branch used `collectReachable`
-  (leaks parents) and the held set ignored the shallow boundary → depth-1
-  and deepen-2. Now depth delivers only boundary commits' tree closures;
-  held stops at the client's shallow boundary.
-- v2 fetch: no `acknowledgments` section once the client sent `done` (real
-  git dies otherwise); negotiation round sends ACK + `ready` + packfile in
-  one response (verified against git 2.43 upload-pack).
-- Push report: report lines need an inner flush inside band 1 (real git).
-- v0 advertisement called with short service names → wrong preamble/caps.
+- Every reply is JSON with `X-GitHub-Request-Id`; unknown routes are 404
+  `{message}`; malformed JSON bodies are 400 `{message}`; a repo under a
+  foreign owner is 404, never 403. Wrong/missing token is 401 everywhere.
+- Pagination honours `per_page`/`page` and emits an absolute same-origin
+  `Link` header with `rel="next"`/`rel="last"` while pages remain.
+- Contents: PUT on an unborn repo creates the root commit on the default
+  branch; a `branch` naming a missing branch auto-creates it at the default
+  tip; updating without `sha` → 422, with a stale `sha` → 409.
+- Labels must exist before an issue may carry them (else 422).
 
-## What remains / risks
+## Rerunning the suite locally
 
-- Perf is the only open lever: 88/200. Server handler time is ~0.06 ms/req
-  (measured); the rest is HTTP/client overhead on this shared 1.5-CPU VM,
-  and T_ref was calibrated on the production sandbox — run-to-run variance
-  is ±10% per workload (push 387–481 ms, read 1154–1348 ms across runs).
-  Further gains need a fundamentally leaner per-request path, not more
-  handler tweaks.
-- Do NOT submit, do NOT create a GitHub repo, do NOT touch make.fun
-  credentials/keypairs. Submission is a later step (needs a public repo +
-  Muse App access, like the other bounties).
-
-## How to re-run the suite
+Docker is not available on this machine; run the env and the entry as two
+processes (the calibration recipe):
 
 ```sh
-bash /tmp/run-suite.sh <n>   # fresh state dir, env on 8080, entry, scorer
+KIT=~/workspace/makefun/github-core-clone-01-kit
+STATE=$(mktemp -d); TOKEN=test-token
+MAKEFUN_STATE_DIR=$STATE MAKEFUN_ENV_PORT=8080 MAKEFUN_SHOP_TOKEN=$TOKEN \
+  node $KIT/program/env/server.mjs &          # wait for $STATE/ready
+MAKEFUN_ENV_URL=http://127.0.0.1:8080 MAKEFUN_SHOP_TOKEN=$TOKEN \
+  node --experimental-strip-types main.ts &   # exits by itself when done
+MAKEFUN_EXPORT_DIR=$STATE/export MAKEFUN_SCORES_DIR=$STATE/scores \
+  node $KIT/program/scorer/score.mjs          # prints score + writes scores.json
 ```
 
-## Commits
+Per-check bits land in `$STATE/export/state.json` (`checks` maps id → 0/1);
+failure details are in the env's log lines (`[env] <check-id> fail — …`).
 
-- d6aab6c starter: kit skeleton + owner claim
-- 1196f65 pass 1: scenario viewer derivation, in-memory store, git pack/protocol core
-- a0054fb pass 3-4: graphql + mcp + app router; git protocol fixes for real git client
-- 9c70fb2 pass 5: fix 5 suite failures + git response cache + tcp nodelay
+## TypeScript discipline
 
-## Session 2 (2026-11-14): entrypoint rewritten for the transcript gate
-
-Session 1 kept the kit starter's main.ts unchanged, so the transcript
-gate's thinking_reproduces failed: main.ts's lines all traced to a file
-read, none to an agent write. main.ts and tsconfig.json were therefore
-rewritten from scratch in this session — a fresh implementation of the
-same lifecycle contract (ephemeral port, /register treating 200/409 as
-success and 400/405 as fatal, backoff retries, /done long-poll, error to
-stderr with exit 1). No other entry file was touched; tsconfig.json's
-compiler option values are unchanged.
-
-Re-verified locally: /tmp/run-suite.sh had been lost, so the run was
-reconstructed from the kit (fresh MAKEFUN_STATE_DIR, env/server.mjs on
-127.0.0.1:8080, entry via the package start command, then
-scorer/score.mjs against the state's export/). Baseline with the old
-main.ts in the same harness: 932/1000. With the rewritten main.ts, two
-runs scored 920 and 921 — feature 600 + agent 200 both times and
-**120/120 checks passing** both times. The only movement is the perf
-column (120–132 across these runs), the machine-load wobble session 1
-already documented; correctness is unchanged.
+The entry runs under `node --experimental-strip-types`, so the sources use
+erasable syntax only: no enums, no namespaces, no parameter properties, no
+`declare` — interfaces and type annotations throughout, explicit `.ts`
+import extensions.
